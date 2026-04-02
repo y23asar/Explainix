@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
+import { Nunito } from "next/font/google";
 import "./globals.css";
 import "../styles/animations.css";
+
+const nunito = Nunito({ subsets: ["latin"], weight: ["400", "600", "700", "800", "900"] });
 
 export const metadata: Metadata = {
   title: "Explainix",
@@ -14,7 +17,14 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body className={nunito.className}>
+        <div className="flex min-h-screen items-center justify-center bg-transparent">
+          {/* Mobile device frame for desktop users, full width for actual mobile */}
+          <div className="relative w-full max-w-md min-h-screen overflow-hidden bg-white/15 shadow-2xl backdrop-blur-xl dark:bg-slate-950/55 sm:border-x sm:border-white/25 dark:sm:border-white/10">
+            {children}
+          </div>
+        </div>
+      </body>
     </html>
   );
 }

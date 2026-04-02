@@ -2,18 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color-scheme: dark;
-}
-
 html,
 body {
   margin: 0;
-  min-height: 100%;
-  background: radial-gradient(circle at top right, #171a25 0%, #090b10 45%, #050608 100%);
-  color: #eceef7;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #FFE08A 0%, #FF6B6B 45%, #8D4B2E 100%);
+  color: #1f2937;
+  overflow-x: hidden;
+}
+
+/* Dark mode is driven by the `dark` class on the <html> element. */
+.dark body {
+  background: linear-gradient(135deg, #0b1020 0%, #070914 45%, #0f172a 100%);
+  color: #e5e7eb;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Hide scrollbar for a cleaner mobile experience */
+::-webkit-scrollbar {
+  display: none;
 }
