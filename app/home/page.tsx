@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { defaultPreferences, getExplainixPreferences, type ExplainixPreferences } from "@/lib/preferences";
 
 type Profile = {
   name?: string;
@@ -18,6 +19,8 @@ type ChatSession = {
   preview: string;
   updatedAt: number;
 };
+
+type GenerationMode = "reels4" | "reels8" | "fullVideo" | "notes" | "quiz" | "meme";
 
 const CHATS_KEY = "explainixChatHistory";
 
@@ -74,11 +77,27 @@ export default function HomePage() {
     }
   });
 
+  const [prefs, setPrefs] = useState<ExplainixPreferences>(() => {
+    if (typeof window === "undefined") return defaultPreferences;
+    return getExplainixPreferences();
+  });
+
   const [chatText, setChatText] = useState("");
   const [chats, setChats] = useState<ChatSession[]>(() => {
     if (typeof window === "undefined") return [];
+    try {
+      const p = getExplainixPreferences();
+      if (!p.usage.autoSaveChats) return [];
+    } catch {
+      // ignore
+    }
     return loadChats();
   });
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatMode, setChatMode] = useState<GenerationMode>("reels8");
+  const [latestUser, setLatestUser] = useState<string | null>(null);
+  const [latestAssistant, setLatestAssistant] = useState<string | null>(null);
+
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -115,6 +134,25 @@ export default function HomePage() {
   }, [theme]);
 
   useEffect(() => {
+    const apply = () => setPrefs(getExplainixPreferences());
+    window.addEventListener("explainix-preferences-changed", apply);
+    window.addEventListener("storage", apply);
+    return () => {
+      window.removeEventListener("explainix-preferences-changed", apply);
+      window.removeEventListener("storage", apply);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!prefs.usage.autoSaveChats) {
+      localStorage.removeItem(CHATS_KEY);
+      setChats([]);
+    } else {
+      setChats(loadChats());
+    }
+  }, [prefs.usage.autoSaveChats]);
+
+  useEffect(() => {
     const id = window.setInterval(() => {
       setMissionIndex((i) => (i + 1) % missions.length);
     }, 2000);
@@ -126,7 +164,22 @@ export default function HomePage() {
     [profile.firstName].filter(Boolean).join(" ") ||
     "Explorer";
 
-  const cards = useMemo(() => buildRecommendations(profile), [profile]);
+  const effectiveProfile = useMemo<Profile>(() => {
+    if (!prefs.privacy.personalizeRecommendations) {
+      return {
+        ...profile,
+        favoriteSubject: prefs.learningStyle.subject,
+        stream: "General",
+        role: "Student",
+      };
+    }
+    return {
+      ...profile,
+      favoriteSubject: prefs.learningStyle.subject || profile.favoriteSubject,
+    };
+  }, [prefs.learningStyle.subject, prefs.privacy.personalizeRecommendations, profile]);
+
+  const cards = useMemo(() => buildRecommendations(effectiveProfile), [effectiveProfile]);
 
   const filteredChats = useMemo(() => {
     const q = historySearch.trim().toLowerCase();
@@ -138,26 +191,66 @@ export default function HomePage() {
     );
   }, [chats, historySearch]);
 
-  const appendChatSession = useCallback((title: string, preview: string) => {
-    const id = `c-${Date.now()}`;
-    const next: ChatSession = {
-      id,
-      title,
-      preview,
-      updatedAt: Date.now(),
-    };
-    setChats((prev) => {
-      const merged = [next, ...prev.filter((c) => c.id !== id)];
-      saveChats(merged);
-      return merged;
-    });
-  }, []);
+  const appendChatSession = useCallback(
+    (title: string, preview: string) => {
+      const id = `c-${Date.now()}`;
+      const next: ChatSession = {
+        id,
+        title,
+        preview,
+        updatedAt: Date.now(),
+      };
+      setChats((prev) => {
+        const merged = [next, ...prev.filter((c) => c.id !== id)];
+        if (prefs.usage.autoSaveChats) saveChats(merged);
+        return merged;
+      });
+    },
+    [prefs.usage.autoSaveChats],
+  );
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const t = chatText.trim();
-    if (!t) return;
-    appendChatSession(t.slice(0, 40) || "Chat", t);
-    setChatText("");
+    if (!t || chatLoading) return;
+
+    setLatestUser(t);
+    setChatLoading(true);
+
+    try {
+      const apiKey = localStorage.getItem("explainixOpenAIKey") ?? "";
+      if (!apiKey) {
+        const msg = "Add your API key in Settings > Preferences > Chat & API (temporary dev).";
+        setLatestAssistant(msg);
+        appendChatSession(t.slice(0, 40) || "Chat", msg);
+        return;
+      }
+
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: t,
+          mode: chatMode,
+          model: prefs.chat.model,
+          apiKey,
+          learningStyle: prefs.learningStyle,
+        }),
+      });
+
+      const data = (await resp.json()) as { reply?: string; error?: string };
+      if (!resp.ok || !data.reply) {
+        throw new Error(data.error ?? "Chat request failed");
+      }
+
+      setLatestAssistant(data.reply);
+      appendChatSession(t.slice(0, 40) || "Chat", data.reply.slice(0, 180));
+    } catch {
+      setLatestAssistant("Could not generate a reply. Check your API key and try again.");
+      appendChatSession(t.slice(0, 40) || "Chat", "Chat failed (API key/config issue).");
+    } finally {
+      setChatText("");
+      setChatLoading(false);
+    }
   };
 
   const handleCardClick = (id: string, title: string) => {
@@ -165,16 +258,21 @@ export default function HomePage() {
       setReelsPickerOpen(true);
       return;
     }
+    if (id === "notes") setChatMode("notes");
+    if (id === "quiz") setChatMode("quiz");
+    if (id === "meme") setChatMode("meme");
     appendChatSession(title, `Opened: ${title}`);
   };
 
   const confirmReelsPack = (pack: "4" | "8") => {
     setReelsPack(pack);
+    setChatMode(pack === "4" ? "reels4" : "reels8");
     appendChatSession(`Reels pack (${pack})`, `Generate ${pack} reels`);
   };
 
   const handleFiles = (files: FileList | null) => {
     if (!files?.length) return;
+    setChatMode("notes");
     const names = Array.from(files)
       .map((f) => f.name)
       .join(", ");
@@ -188,13 +286,15 @@ export default function HomePage() {
   };
 
   const handleNewChat = () => {
-    localStorage.removeItem(CHATS_KEY);
+    if (prefs.usage.autoSaveChats) localStorage.removeItem(CHATS_KEY);
     setChats([]);
     setHistorySearch("");
     setChatText("");
     setUploadedFileNames([]);
     setReelsPack(null);
     setReelsPickerOpen(false);
+    setLatestUser(null);
+    setLatestAssistant(null);
     router.push("/home");
   };
 
@@ -222,7 +322,7 @@ export default function HomePage() {
             setProfileMenuOpen((v) => !v);
             setHistoryOpen(false);
           }}
-          className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-red-400 to-orange-400 text-sm font-extrabold text-white shadow-md"
+          className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-full bg-[linear-gradient(to_bottom_right,var(--accent-from),var(--accent-to))] text-sm font-extrabold text-white shadow-md"
           aria-label="Profile"
           aria-haspopup="true"
         >
@@ -251,17 +351,13 @@ export default function HomePage() {
             </button>
             <button
               type="button"
-              onClick={() => setProfileMenuOpen(false)}
+              onClick={() => {
+                setProfileMenuOpen(false);
+                router.push("/profile");
+              }}
               className="block w-full px-4 py-3 text-left text-sm font-bold text-slate-800 hover:bg-slate-50 dark:text-white dark:hover:bg-slate-900/60"
             >
-              Preferences
-            </button>
-            <button
-              type="button"
-              onClick={() => setProfileMenuOpen(false)}
-              className="block w-full px-4 py-3 text-left text-sm font-bold text-slate-800 hover:bg-slate-50 dark:text-white dark:hover:bg-slate-900/60"
-            >
-              Manage account
+              Account & Profile
             </button>
             <button
               type="button"
@@ -306,9 +402,20 @@ export default function HomePage() {
                   setHistoryOpen(false);
                   handleNewChat();
                 }}
-                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-red-500 to-orange-400 px-4 py-3 text-sm font-extrabold text-white shadow-lg"
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] px-4 py-3 text-sm font-extrabold text-white shadow-lg"
               >
                 + New Chat
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setHistoryOpen(false);
+                  router.push("/help");
+                }}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/60 px-4 py-3 text-sm font-extrabold text-slate-800 shadow-sm hover:bg-white/80 dark:border-white/10 dark:bg-white/5 dark:text-white"
+              >
+                Get Help
               </button>
 
               <input
@@ -320,16 +427,20 @@ export default function HomePage() {
 
               <div className="grid grid-cols-2 gap-2">
                 {[
-                  { label: "Images", icon: "🖼️" },
-                  { label: "Apps", icon: "🧩" },
-                  { label: "Deep research", icon: "🔎" },
-                  { label: "Projects", icon: "📁" },
+                  { label: "Images", icon: "🖼️", mode: "meme" as GenerationMode },
+                  { label: "Videos", icon: "🎬", mode: "fullVideo" as GenerationMode },
+                  { label: "Notes", icon: "📝", mode: "notes" as GenerationMode },
+                  { label: "Projects", icon: "📁", mode: "quiz" as GenerationMode },
                 ].map((x) => (
                   <button
                     key={x.label}
                     type="button"
-                    onClick={() => appendChatSession(x.label, `Opened: ${x.label}`)}
-                    className="glass-hover rounded-2xl border border-slate-200/70 bg-white/60 px-3 py-3 text-left text-xs font-extrabold text-slate-800 dark:border-white/10 dark:bg-white/5 dark:text-white"
+                    onClick={() => {
+                      setChatMode(x.mode);
+                      setHistoryOpen(false);
+                      appendChatSession(x.label, `Opened: ${x.label}`);
+                    }}
+                    className="glass-hover flex min-h-[102px] flex-col justify-between rounded-2xl border border-slate-200/70 bg-white/60 px-3 py-3 text-left text-xs font-extrabold text-slate-800 dark:border-white/10 dark:bg-white/5 dark:text-white"
                   >
                     <div className="text-lg">{x.icon}</div>
                     <div className="mt-1">{x.label}</div>
@@ -374,7 +485,7 @@ export default function HomePage() {
               </p>
               <div className="relative flex items-center rounded-2xl border border-slate-200/80 bg-white/60 p-1 dark:border-white/10 dark:bg-white/5">
                 <div
-                  className="absolute top-1 bottom-1 left-1 w-[calc(50%-2px)] rounded-xl bg-gradient-to-r from-red-500 to-orange-400 transition-transform duration-300"
+                  className="absolute top-1 bottom-1 left-1 w-[calc(50%-2px)] rounded-xl bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] transition-transform duration-300"
                   style={{
                     transform: theme === "dark" ? "translateX(100%)" : "translateX(0%)",
                   }}
@@ -412,22 +523,45 @@ export default function HomePage() {
             key={card.id}
             type="button"
             onClick={() => handleCardClick(card.id, card.title)}
-            className={`glass-hover rounded-3xl bg-gradient-to-br ${card.color} p-4 text-left text-white shadow-xl`}
+            className={`glass-hover flex h-[118px] flex-col justify-between rounded-3xl bg-gradient-to-br ${card.color} p-4 text-left text-white shadow-xl`}
           >
-            <div className="text-4xl">{card.icon}</div>
-            <p className="mt-3 text-sm font-extrabold leading-tight">{card.title}</p>
+            <div className="text-4xl leading-none">{card.icon}</div>
+            <p className="mt-3 text-sm font-extrabold leading-tight line-clamp-2">{card.title}</p>
           </button>
         ))}
       </section>
 
       <section className="px-5 pt-5">
-        <div className="rounded-3xl bg-white/85 p-4 shadow-md dark:bg-slate-900/60 dark:border dark:border-white/10 dark:shadow-none">
+        <div className="rounded-3xl bg-white/85 p-4 shadow-md dark:border dark:border-white/10 dark:bg-slate-900/60 dark:shadow-none">
           <div key={missionIndex} className="mission-flip">
             <p className="text-sm font-bold text-slate-800 dark:text-white">{missions[missionIndex].title}</p>
             <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{missions[missionIndex].body}</p>
           </div>
         </div>
       </section>
+
+      {(latestUser || latestAssistant || chatLoading) && (
+        <section className="px-5 pt-4">
+          <div className="rounded-3xl border border-white/70 bg-white/90 p-3 shadow-md dark:border-white/10 dark:bg-slate-900/60">
+            <p className="text-[11px] font-extrabold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              Chat · {chatMode}
+            </p>
+            {latestUser ? (
+              <p className="mt-2 rounded-2xl bg-slate-100/90 px-3 py-2 text-sm font-semibold text-slate-800 dark:bg-white/5 dark:text-white">
+                {latestUser}
+              </p>
+            ) : null}
+            {chatLoading ? (
+              <p className="mt-2 text-xs font-bold text-slate-500 dark:text-slate-400">Thinking…</p>
+            ) : null}
+            {latestAssistant ? (
+              <p className="mt-2 whitespace-pre-wrap rounded-2xl bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] px-3 py-2 text-sm font-semibold text-white">
+                {latestAssistant}
+              </p>
+            ) : null}
+          </div>
+        </section>
+      )}
 
       <div className="fixed bottom-4 left-1/2 z-20 w-[calc(100%-24px)] max-w-[406px] -translate-x-1/2 space-y-2">
         {reelsPickerOpen && (
@@ -439,7 +573,7 @@ export default function HomePage() {
                 onClick={() => confirmReelsPack("4")}
                 className={`flex-1 rounded-xl py-2.5 text-sm font-extrabold ${
                   reelsPack === "4"
-                    ? "bg-gradient-to-r from-red-500 to-orange-400 text-white"
+                    ? "bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] text-white"
                     : "bg-white text-slate-800 ring-1 ring-slate-200"
                 }`}
               >
@@ -450,7 +584,7 @@ export default function HomePage() {
                 onClick={() => confirmReelsPack("8")}
                 className={`flex-1 rounded-xl py-2.5 text-sm font-extrabold ${
                   reelsPack === "8"
-                    ? "bg-gradient-to-r from-red-500 to-orange-400 text-white"
+                    ? "bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] text-white"
                     : "bg-white text-slate-800 ring-1 ring-slate-200"
                 }`}
               >
@@ -511,12 +645,15 @@ export default function HomePage() {
               onChange={(e) => setChatText(e.target.value)}
               placeholder="Ask Explainix anything..."
               className="min-h-0 flex-1 rounded-2xl border border-slate-200 px-3 py-2.5 text-sm font-medium text-slate-700 outline-none focus:border-indigo-400 dark:border-white/10 dark:bg-white/5 dark:text-white"
-              onKeyDown={(e) => e.key === "Enter" && handleSend()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleSend();
+              }}
             />
             <button
               type="button"
-              onClick={handleSend}
-              className="shrink-0 rounded-2xl bg-indigo-600 px-3 py-2.5 text-sm font-extrabold text-white hover:scale-[1.01] transition"
+              onClick={() => void handleSend()}
+              disabled={chatLoading}
+              className="shrink-0 rounded-2xl bg-[linear-gradient(to_right,var(--accent-from),var(--accent-to))] px-3 py-2.5 text-sm font-extrabold text-white transition hover:scale-[1.01] disabled:opacity-60"
             >
               Send
             </button>
